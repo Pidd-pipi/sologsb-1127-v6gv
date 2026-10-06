@@ -1,6 +1,16 @@
 import type { Inspection, InspectionConclusion, OccupiedLevel } from '../types/inspection';
 import type { RouteSegment, RouteVerdict } from '../types/route';
 
+/**
+ * 路段端点的点位核验信息。
+ * conclusion 缺省（未核验）时不据此阻断通行。
+ */
+export interface SegmentEndpoint {
+  conclusion?: InspectionConclusion;
+  /** 点位名称，用于在卡点提示里定位 */
+  name?: string;
+}
+
 /** 阈值常量：依据《无障碍设计规范》常用核验口径 */
 export const SLOPE_PASS = 5; // 坡度 ≤ 5% 为合格
 export const SLOPE_FAIL = 8; // 坡度 > 8% 直接不合格
@@ -70,6 +80,38 @@ export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' 
   return { passable: reasons.length === 0, reasons };
 }
 
+/** 端点点位的最新核验结论是否阻断轮椅通行（未核验不阻断） */
+export function endpointBlockReason(endpoint: SegmentEndpoint | undefined): string {
+  if (!endpoint || endpoint.conclusion !== '不合格') return '';
+  const who = endpoint.name ? `端点点位「${endpoint.name}」` : '端点点位';
+  return `${who}最新核验为不合格，轮椅无法在该处通行`;
+}
+
+export interface SegmentJudgeInput {
+  seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount'>;
+  /** 起点点位最新核验 */
+  from?: SegmentEndpoint;
+  /** 终点点位最新核验 */
+  to?: SegmentEndpoint;
+}
+
+/**
+ * 单段综合判定：路段本身的高差/台阶/障碍，加上两端点位的最新核验结论。
+ * 结论一变（补录新核验）后据此重算 wheelchairPassable。
+ */
+export function judgeSegmentWithEndpoints(input: SegmentJudgeInput): {
+  passable: boolean;
+  reasons: string[];
+} {
+  const base = judgeSegment(input.seg);
+  const reasons = [...base.reasons];
+  for (const endpoint of [input.from, input.to]) {
+    const reason = endpointBlockReason(endpoint);
+    if (reason) reasons.push(reason);
+  }
+  return { passable: reasons.length === 0, reasons };
+}
+
 /** 全线判定：逐段判定后汇总 */
 export function buildVerdict(
   routeName: string,
@@ -77,6 +119,7 @@ export function buildVerdict(
     RouteSegment,
     'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
   >[],
+  endpointResolver?: (pointId: string) => SegmentEndpoint | undefined,
 ): RouteVerdict {
   const ordered = [...segments].sort((a, b) => a.order - b.order);
   const totalLength = Math.round(ordered.reduce((n, s) => n + (Number(s.length) || 0), 0) * 10) / 10;
@@ -85,7 +128,13 @@ export function buildVerdict(
   const maxCurbHeight = ordered.reduce((n, s) => Math.max(n, Number(s.curbHeight) || 0), 0);
   const reasons: string[] = [];
   ordered.forEach((s) => {
-    const r = judgeSegment(s);
+    const r = endpointResolver
+      ? judgeSegmentWithEndpoints({
+          seg: s,
+          from: endpointResolver(s.fromPointId),
+          to: endpointResolver(s.toPointId),
+        })
+      : judgeSegment(s);
     if (!r.passable) {
       reasons.push(`第 ${s.order} 段：${r.reasons.join('；')}`);
     }

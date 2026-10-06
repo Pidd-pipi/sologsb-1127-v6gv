@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   App,
   Button,
@@ -8,6 +8,7 @@ import {
   Divider,
   Form,
   Input,
+  Modal,
   Row,
   Select,
   Space,
@@ -25,11 +26,12 @@ import MeasureInput from '../components/common/MeasureInput';
 import StatusBadge from '../components/common/StatusBadge';
 import FacilityIcon from '../components/common/FacilityIcon';
 import EmptyState from '../components/common/EmptyState';
-import { usePointStore } from '../stores/pointStore';
+import { usePointStore, type AddInspectionResult, type InspectionConflict } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
 import type { RectifyPlan } from '../types/rectify';
 import { judgeInspection } from '../utils/routeCheck';
 import { addDays, isOverdue, todayStr } from '../utils/format';
+import { sortInspectionsLatestFirst } from '../utils/inspection';
 
 interface InlineInspection {
   date: string;
@@ -54,10 +56,7 @@ export default function PointDetail() {
 
   const point = useMemo(() => points.find((p) => p.id === id), [points, id]);
   const history = useMemo(
-    () =>
-      inspections
-        .filter((i) => i.pointId === id)
-        .sort((a, b) => (a.date < b.date ? 1 : -1)),
+    () => sortInspectionsLatestFirst(inspections.filter((i) => i.pointId === id)),
     [inspections, id],
   );
   const plans = useMemo(
@@ -77,6 +76,21 @@ export default function PointDetail() {
     problem: '',
   }));
   const [saving, setSaving] = useState(false);
+  /** 另一标签页刚录入核验时，先弹出选择，再决定本条去留 */
+  const [conflict, setConflict] = useState<InspectionConflict | null>(null);
+  const conflictRetryRef = useRef<
+    ((decision: 'keep' | 'discard') => Promise<AddInspectionResult>) | null
+  >(null);
+  /**
+   * 本页已知的最新核验 id 基线，仅在进入点位页 / 完成保存 / 放弃本条时更新。
+   * 其它标签页静默刷新会更新 history，但不动这个基线，因此后保存时一定能察觉对方刚录的核验。
+   */
+  const knownLatestRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (loaded && point) knownLatestRef.current = history[0]?.id;
+    // 只按加载完成与点位切换建立基线，不随静默刷新更新
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, id]);
 
   const judgement = useMemo(
     () =>
@@ -118,22 +132,58 @@ export default function PointDetail() {
   const handleSaveInspection = async () => {
     setSaving(true);
     try {
-      await addInspection({
-        pointId: point.id,
-        date: form.date || todayStr(),
-        inspector: form.inspector.trim() || '未署名督导员',
-        slope: form.slope,
-        clearWidth: form.clearWidth,
-        hasHandrail: form.hasHandrail,
-        tactileContinuous: form.tactileContinuous,
-        occupied: form.occupied,
-        conclusion: judgement.conclusion,
-        problem: form.problem.trim(),
-      });
+      const result = await addInspection(
+        {
+          pointId: point.id,
+          date: form.date || todayStr(),
+          inspector: form.inspector.trim() || '未署名督导员',
+          slope: form.slope,
+          clearWidth: form.clearWidth,
+          hasHandrail: form.hasHandrail,
+          tactileContinuous: form.tactileContinuous,
+          occupied: form.occupied,
+          conclusion: judgement.conclusion,
+          problem: form.problem.trim(),
+        },
+        // 保存前以本页进入时已知的最新核验为基线，基线变了说明另一标签页刚录了一条
+        { expectedLatestId: knownLatestRef.current },
+      );
+      if (result.outcome === 'conflict') {
+        conflictRetryRef.current = result.retry;
+        setConflict(result.conflict);
+        return;
+      }
+      knownLatestRef.current = result.inspection.id;
       message.success(`已新增核验记录（${judgement.conclusion}）`);
       setForm((cur) => ({ ...cur, problem: '', date: todayStr() }));
     } catch (e) {
       message.error(`核验记录保存失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleConflictDecision = async (decision: 'keep' | 'discard') => {
+    const retry = conflictRetryRef.current;
+    if (!retry) return;
+    setSaving(true);
+    try {
+      const result = await retry(decision);
+      setConflict(null);
+      conflictRetryRef.current = null;
+      // 冲突已处理，以当前库里的最新核验作为新基线
+      knownLatestRef.current =
+        result.outcome === 'saved'
+          ? usePointStore.getState().inspectionsOf(point.id)[0]?.id
+          : knownLatestRef.current;
+      if (decision === 'discard') {
+        message.info('已保留另一标签页录入的核验，本条未保存');
+      } else {
+        message.success('你的核验也已保存，系统按较新一条核验判定点位结论');
+        setForm((cur) => ({ ...cur, problem: '', date: todayStr() }));
+      }
+    } catch (e) {
+      message.error(`核验保存失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSaving(false);
     }
@@ -422,6 +472,84 @@ export default function PointDetail() {
           />
         )}
       </Card>
+
+      <Modal
+        title="发现另一标签页刚录入的核验"
+        open={Boolean(conflict)}
+        onCancel={() => {
+          setConflict(null);
+          conflictRetryRef.current = null;
+          setSaving(false);
+        }}
+        footer={[
+          <Button
+            key="discard"
+            loading={saving}
+            onClick={() => handleConflictDecision('discard')}
+            data-testid="conflict-discard"
+          >
+            放弃我的，采用对方
+          </Button>,
+          <Button
+            key="keep"
+            type="primary"
+            loading={saving}
+            onClick={() => handleConflictDecision('keep')}
+            data-testid="conflict-keep"
+          >
+            仍保存我的（两条都留）
+          </Button>,
+        ]}
+        maskClosable={false}
+        destroyOnClose
+      >
+        {conflict ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Typography.Text type="secondary">
+              该点位已存在一条更新的核验记录，请先核对对方录入的内容，再决定是否保留你这一条，不会覆盖对方数据。
+            </Typography.Text>
+            <Card size="small" title="对方刚录入的核验（已保存）" data-testid="conflict-incoming">
+              <Space direction="vertical" size={4}>
+                <Space wrap>
+                  <Tag>{conflict.incoming.date}</Tag>
+                  <StatusBadge value={conflict.incoming.conclusion} kind="conclusion" />
+                  <Typography.Text type="secondary">{conflict.incoming.inspector}</Typography.Text>
+                </Space>
+                <Typography.Text>
+                  坡度 {conflict.incoming.slope}% · 净宽 {conflict.incoming.clearWidth}cm ·{' '}
+                  {conflict.incoming.hasHandrail ? '有扶手' : '无扶手'} ·{' '}
+                  {conflict.incoming.tactileContinuous ? '盲道连续' : '盲道断续'} · 占用：
+                  {conflict.incoming.occupied}
+                </Typography.Text>
+                {conflict.incoming.problem ? (
+                  <Typography.Text type="secondary">问题：{conflict.incoming.problem}</Typography.Text>
+                ) : null}
+              </Space>
+            </Card>
+            <Card size="small" title="你本次待保存的核验" data-testid="conflict-pending">
+              <Space direction="vertical" size={4}>
+                <Space wrap>
+                  <Tag>{conflict.pending.date}</Tag>
+                  <StatusBadge value={conflict.pending.conclusion} kind="conclusion" />
+                  <Typography.Text type="secondary">{conflict.pending.inspector}</Typography.Text>
+                </Space>
+                <Typography.Text>
+                  坡度 {conflict.pending.slope}% · 净宽 {conflict.pending.clearWidth}cm ·{' '}
+                  {conflict.pending.hasHandrail ? '有扶手' : '无扶手'} ·{' '}
+                  {conflict.pending.tactileContinuous ? '盲道连续' : '盲道断续'} · 占用：
+                  {conflict.pending.occupied}
+                </Typography.Text>
+                {conflict.pending.problem ? (
+                  <Typography.Text type="secondary">问题：{conflict.pending.problem}</Typography.Text>
+                ) : null}
+              </Space>
+            </Card>
+            <Typography.Text type="warning">
+              两条都保留时，点位结论、整改条目与路线通行按日期（同日按录入时间）最新的一条核验计算。
+            </Typography.Text>
+          </Space>
+        ) : null}
+      </Modal>
     </div>
   );
 }

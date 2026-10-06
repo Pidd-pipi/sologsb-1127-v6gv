@@ -9,6 +9,7 @@ import { usePointStore } from '../stores/pointStore';
 import { useUiStore } from '../stores/uiStore';
 import { FACILITY_TYPES, type AccessPoint } from '../types/point';
 import { isOverdue } from '../utils/format';
+import { sortInspectionsLatestFirst } from '../utils/inspection';
 
 export default function MapView() {
   const points = usePointStore((s) => s.points);
@@ -25,13 +26,11 @@ export default function MapView() {
   );
 
   const latestOf = (pointId: string) =>
-    inspections
-      .filter((i) => i.pointId === pointId)
-      .sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+    sortInspectionsLatestFirst(inspections.filter((i) => i.pointId === pointId))[0];
 
   const active = points.find((p) => p.id === activeId);
   const activeInspections = active
-    ? inspections.filter((i) => i.pointId === active.id).sort((a, b) => (a.date < b.date ? 1 : -1))
+    ? sortInspectionsLatestFirst(inspections.filter((i) => i.pointId === active.id))
     : [];
   const activePlans = active ? rectifies.filter((r) => r.pointId === active.id) : [];
 

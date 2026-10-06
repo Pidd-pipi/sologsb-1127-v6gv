@@ -23,11 +23,13 @@ import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { useRouteStore, type DraftSegment } from '../stores/routeStore';
 import type { RouteSegment, RouteVerdict } from '../types/route';
-import { buildVerdict, judgeSegment, CURB_FAIL, CURB_PASS } from '../utils/routeCheck';
+import { buildVerdict, judgeSegmentWithEndpoints, CURB_FAIL, CURB_PASS } from '../utils/routeCheck';
+import { latestInspectionByPoint } from '../utils/inspection';
 
 export default function Routes() {
   const { message } = App.useApp();
   const points = usePointStore((s) => s.points);
+  const inspections = usePointStore((s) => s.inspections);
   const {
     segments,
     draftName,
@@ -50,6 +52,19 @@ export default function Routes() {
     [points],
   );
   const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
+
+  /** 端点最新核验结论，保存后的路线据此重判并标出卡在哪一段 */
+  const latestByPoint = useMemo(() => latestInspectionByPoint(inspections), [inspections]);
+  const endpointOf = useMemo(() => {
+    return (pointId: string) => {
+      const point = points.find((p) => p.id === pointId);
+      const latest = latestByPoint.get(pointId);
+      return {
+        conclusion: latest?.conclusion,
+        name: point?.name ?? pointId,
+      };
+    };
+  }, [points, latestByPoint]);
 
   const draftVerdict = verdict ?? null;
 
@@ -147,9 +162,14 @@ export default function Routes() {
     {
       title: '段判定',
       width: 110,
-      render: (_, row) => (
-        <StatusBadge value={judgeSegment(row).passable ? '可通行' : '不可通行'} kind="route" />
-      ),
+      render: (_, row) => {
+        const { passable } = judgeSegmentWithEndpoints({
+          seg: row,
+          from: endpointOf(row.fromPointId),
+          to: endpointOf(row.toPointId),
+        });
+        return <StatusBadge value={passable ? '可通行' : '不可通行'} kind="route" />;
+      },
     },
     {
       title: '操作',
@@ -181,6 +201,19 @@ export default function Routes() {
       width: 120,
       render: (v: boolean) => <StatusBadge value={v ? '可通行' : '不可通行'} kind="route" />,
     },
+    {
+      title: '卡点',
+      key: 'block',
+      render: (_, row) => {
+        const reasons = blockReasonBySegment.get(row.id);
+        if (!reasons) return <Typography.Text type="secondary">—</Typography.Text>;
+        return (
+          <Typography.Text type="danger" data-testid={`segment-block-${row.id}`}>
+            卡在第 {row.order} 段：{reasons.join('；')}
+          </Typography.Text>
+        );
+      },
+    },
   ];
 
   const savedVerdicts = useMemo(() => {
@@ -191,9 +224,23 @@ export default function Routes() {
       byName.set(s.routeName, list);
     }
     const rows: RouteVerdict[] = [];
-    byName.forEach((list, name) => rows.push(buildVerdict(name, list)));
+    byName.forEach((list, name) => rows.push(buildVerdict(name, list, endpointOf)));
     return rows;
-  }, [segments]);
+  }, [segments, endpointOf]);
+
+  /** 每段不通的原因（含端点最新核验不合格），用于明细表「卡点」列 */
+  const blockReasonBySegment = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const s of segments) {
+      const { passable, reasons } = judgeSegmentWithEndpoints({
+        seg: s,
+        from: endpointOf(s.fromPointId),
+        to: endpointOf(s.toPointId),
+      });
+      if (!passable) map.set(s.id, reasons);
+    }
+    return map;
+  }, [segments, endpointOf]);
 
   return (
     <div>
@@ -252,7 +299,7 @@ export default function Routes() {
                       message.warning('请先串联路段');
                       return;
                     }
-                    computeVerdict();
+                    void computeVerdict();
                   }}
                   data-testid="compute-verdict"
                 >
@@ -350,17 +397,29 @@ export default function Routes() {
             )}
           </Card>
 
-          <Card title="已编制路线判定" size="small" style={{ marginTop: 16 }}>
+          <Card title="已编制路线判定（随点位最新核验重算）" size="small" style={{ marginTop: 16 }}>
             {savedVerdicts.length ? (
               <Space direction="vertical" size={8} style={{ width: '100%' }}>
                 {savedVerdicts.map((v) => (
-                  <Space key={v.routeName} size={8} wrap>
-                    <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
-                    <Typography.Text>{v.routeName}</Typography.Text>
-                    <Tag>{v.totalLength} m</Tag>
-                    <Tag>台阶 {v.totalSteps}</Tag>
-                    <Tag>障碍 {v.totalObstacles}</Tag>
-                  </Space>
+                  <div key={v.routeName} data-testid={`saved-verdict-${v.routeName}`}>
+                    <Space size={8} wrap>
+                      <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
+                      <Typography.Text>{v.routeName}</Typography.Text>
+                      <Tag>{v.totalLength} m</Tag>
+                      <Tag>台阶 {v.totalSteps}</Tag>
+                      <Tag>障碍 {v.totalObstacles}</Tag>
+                    </Space>
+                    {!v.passable ? (
+                      <Typography.Paragraph
+                        type="warning"
+                        className="gb-muted"
+                        style={{ margin: '4px 0 0', whiteSpace: 'pre-line' }}
+                        data-testid={`saved-verdict-blocks-${v.routeName}`}
+                      >
+                        {v.reasons.map((r) => `卡在 ${r}`).join('\n')}
+                      </Typography.Paragraph>
+                    ) : null}
+                  </div>
                 ))}
               </Space>
             ) : (

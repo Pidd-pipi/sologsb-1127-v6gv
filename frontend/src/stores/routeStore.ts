@@ -1,11 +1,20 @@
 import { create } from 'zustand';
 import { db } from '../db';
+import { healDerivedData } from '../db/heal';
 import type { AccessPoint } from '../types/point';
 import type { RouteSegment } from '../types/route';
 import { makeId, toPlain } from '../utils/format';
-import { judgeSegment, buildVerdict } from '../utils/routeCheck';
+import { buildVerdict, judgeSegmentWithEndpoints } from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
+import { latestInspectionByPoint } from '../utils/inspection';
+import { dbSync } from '../utils/sync';
 import type { RouteVerdict } from '../types/route';
+
+function sortSegments(rows: RouteSegment[]): RouteSegment[] {
+  return rows.sort((a, b) =>
+    a.routeName === b.routeName ? a.order - b.order : a.routeName.localeCompare(b.routeName),
+  );
+}
 
 /** 编辑中的路段（尚未落库） */
 export interface DraftSegment {
@@ -29,13 +38,15 @@ interface RouteState {
   draftSegments: DraftSegment[];
   verdict: RouteVerdict | null;
   load: () => Promise<void>;
+  /** 收到其它标签页变更通知后静默重读，不发广播、不重复自愈 */
+  refreshFromDb: () => Promise<void>;
   setDraftName: (name: string) => void;
   setChain: (ids: string[]) => void;
   toggleChainPoint: (id: string) => void;
   buildChainSegments: (points: AccessPoint[]) => void;
   updateDraftSegment: (key: string, patch: Partial<DraftSegment>) => void;
   removeDraftSegment: (key: string) => void;
-  computeVerdict: () => RouteVerdict;
+  computeVerdict: () => Promise<RouteVerdict>;
   saveRoute: () => Promise<number>;
   resetDraft: () => void;
 }
@@ -57,17 +68,17 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   load: async () => {
     set({ loading: true, error: '' });
     try {
-      const rows = await db.routes.toArray();
-      set({
-        segments: rows.sort((a, b) =>
-          a.routeName === b.routeName ? a.order - b.order : a.routeName.localeCompare(b.routeName),
-        ),
-        loading: false,
-        loaded: true,
-      });
+      await healDerivedData();
+      await get().refreshFromDb();
+      set({ loading: false, loaded: true });
     } catch (e) {
       set({ loading: false, loaded: true, error: e instanceof Error ? e.message : String(e) });
     }
+  },
+
+  refreshFromDb: async () => {
+    const rows = await db.routes.toArray();
+    set({ segments: sortSegments(rows) });
   },
 
   setDraftName: (name) => set({ draftName: name }),
@@ -119,17 +130,33 @@ export const useRouteStore = create<RouteState>((set, get) => ({
       verdict: null,
     })),
 
-  computeVerdict: () => {
+  computeVerdict: async () => {
     const { draftSegments, draftName } = get();
-    const verdict = buildVerdict(draftName, draftSegments);
+    const [inspections, pointRows] = await Promise.all([db.inspections.toArray(), db.points.toArray()]);
+    const latestByPoint = latestInspectionByPoint(inspections);
+    const pointNames = new Map(pointRows.map((p) => [p.id, p.name]));
+    const verdict = buildVerdict(draftName, draftSegments, (pointId) => {
+      const latest = latestByPoint.get(pointId);
+      return { conclusion: latest?.conclusion, name: pointNames.get(pointId) ?? pointId };
+    });
     set({ verdict });
     return verdict;
   },
 
   saveRoute: async () => {
     const { draftSegments, draftName } = get();
-    const rows: RouteSegment[] = draftSegments.map((seg) =>
-      toPlain({
+    // 保存即按端点最新核验结论判定，避免新建路线带上旧的可通行判断
+    const [inspections] = await Promise.all([db.inspections.toArray()]);
+    const latestByPoint = latestInspectionByPoint(inspections);
+    const rows: RouteSegment[] = draftSegments.map((seg) => {
+      const from = latestByPoint.get(seg.fromPointId);
+      const to = latestByPoint.get(seg.toPointId);
+      const judged = judgeSegmentWithEndpoints({
+        seg,
+        from: from ? { conclusion: from.conclusion } : undefined,
+        to: to ? { conclusion: to.conclusion } : undefined,
+      });
+      return toPlain({
         id: makeId('rts'),
         routeName: draftName || '未命名路线',
         fromPointId: seg.fromPointId,
@@ -138,19 +165,16 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         obstacleCount: seg.obstacleCount,
         stepCount: seg.stepCount,
         curbHeight: seg.curbHeight,
-        wheelchairPassable: judgeSegment(seg).passable,
+        wheelchairPassable: judged.passable,
         order: seg.order,
         createdAt: new Date().toISOString(),
-      }),
-    );
+      });
+    });
     if (!rows.length) return 0;
     await db.routes.bulkPut(rows);
     const all = await db.routes.toArray();
-    set({
-      segments: all.sort((a, b) =>
-        a.routeName === b.routeName ? a.order - b.order : a.routeName.localeCompare(b.routeName),
-      ),
-    });
+    set({ segments: sortSegments(all) });
+    dbSync.post('routes');
     return rows.length;
   },
 

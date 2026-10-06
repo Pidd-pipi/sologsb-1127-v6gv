@@ -11,6 +11,7 @@ import {
 import { Link, Outlet, useLocation } from 'react-router-dom';
 import { usePointStore } from '../stores/pointStore';
 import { useRouteStore } from '../stores/routeStore';
+import { dbSync } from '../utils/sync';
 
 const { Sider, Content, Header } = Layout;
 
@@ -34,6 +35,21 @@ export default function AppLayout() {
     void loadPoints();
     void loadRoutes();
   }, [loadPoints, loadRoutes]);
+
+  // 其它标签页保存了点位/核验/路线/整改条目时，静默重读最新数据，避免拿着旧快照覆盖
+  useEffect(() => {
+    const unsubscribe = dbSync.subscribe((msg) => {
+      if (msg.kind === 'routes') {
+        void useRouteStore.getState().refreshFromDb();
+      } else {
+        void usePointStore.getState().refreshFromDb();
+        if (msg.kind === 'all' || msg.kind === 'points') {
+          void useRouteStore.getState().refreshFromDb();
+        }
+      }
+    });
+    return unsubscribe;
+  }, []);
 
   const selectedKey =
     MENU.map((m) => m.key)

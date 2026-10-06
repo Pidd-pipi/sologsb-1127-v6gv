@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   App,
   Button,
@@ -8,6 +8,7 @@ import {
   Divider,
   Form,
   Input,
+  Modal,
   Row,
   Select,
   Space,
@@ -28,8 +29,10 @@ import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
 import type { RectifyPlan } from '../types/rectify';
+import { db } from '../db';
 import { judgeInspection } from '../utils/routeCheck';
 import { addDays, isOverdue, todayStr } from '../utils/format';
+import { compareInspections } from '../utils/reconcile';
 
 interface InlineInspection {
   date: string;
@@ -54,10 +57,7 @@ export default function PointDetail() {
 
   const point = useMemo(() => points.find((p) => p.id === id), [points, id]);
   const history = useMemo(
-    () =>
-      inspections
-        .filter((i) => i.pointId === id)
-        .sort((a, b) => (a.date < b.date ? 1 : -1)),
+    () => inspections.filter((i) => i.pointId === id).sort((a, b) => -compareInspections(a, b)),
     [inspections, id],
   );
   const plans = useMemo(
@@ -77,6 +77,28 @@ export default function PointDetail() {
     problem: '',
   }));
   const [saving, setSaving] = useState(false);
+  /** 冲突提示：打开详情后，本点位被其他标签页先录入了更新的核验 */
+  const [conflict, setConflict] = useState<{ theirs: Inspection } | null>(null);
+  /**
+   * 本标签页已经知情的本点位最新核验 id。
+   * 打开页面（数据首次加载完成）时记录一次；保存成功或在冲突弹窗明确选择后才推进，
+   * 保证「对方先录入」不会被静默覆盖。
+   */
+  const seenLatestIdRef = useRef<string>('');
+  const baselineReadyRef = useRef(false);
+  useEffect(() => {
+    baselineReadyRef.current = false;
+    seenLatestIdRef.current = '';
+  }, [id]);
+  useEffect(() => {
+    if (baselineReadyRef.current || !loaded) return;
+    baselineReadyRef.current = true;
+    const latest = usePointStore
+      .getState()
+      .inspections.filter((i) => i.pointId === id)
+      .sort((a, b) => -compareInspections(a, b))[0];
+    seenLatestIdRef.current = latest?.id ?? '';
+  }, [loaded, id]);
 
   const judgement = useMemo(
     () =>
@@ -115,29 +137,69 @@ export default function PointDetail() {
     );
   }
 
-  const handleSaveInspection = async () => {
+  /** 把表单组装成待保存的核验草稿 */
+  const buildDraft = (): Parameters<typeof addInspection>[0] => ({
+    pointId: point?.id ?? id,
+    date: form.date || todayStr(),
+    inspector: form.inspector.trim() || '未署名督导员',
+    slope: form.slope,
+    clearWidth: form.clearWidth,
+    hasHandrail: form.hasHandrail,
+    tactileContinuous: form.tactileContinuous,
+    occupied: form.occupied,
+    conclusion: judgement.conclusion,
+    problem: form.problem.trim(),
+  });
+
+  /** 保存核验；force=false 时若发现其他标签页先录入了更新的核验，先弹冲突确认 */
+  const doSave = async (force: boolean) => {
+    if (!point) return;
     setSaving(true);
     try {
-      await addInspection({
-        pointId: point.id,
-        date: form.date || todayStr(),
-        inspector: form.inspector.trim() || '未署名督导员',
-        slope: form.slope,
-        clearWidth: form.clearWidth,
-        hasHandrail: form.hasHandrail,
-        tactileContinuous: form.tactileContinuous,
-        occupied: form.occupied,
-        conclusion: judgement.conclusion,
-        problem: form.problem.trim(),
+      if (!force) {
+        // 以库中数据为准（内存状态可能尚未同步到本标签页）
+        const dbLatest = (await db.inspections.where({ pointId: point.id }).toArray()).sort(
+          (a, b) => -compareInspections(a, b),
+        )[0];
+        if (dbLatest && dbLatest.id !== seenLatestIdRef.current) {
+          setConflict({ theirs: dbLatest });
+          return;
+        }
+      }
+
+      const result = await addInspection(buildDraft());
+      seenLatestIdRef.current = result.inspection.id;
+      const notes: string[] = [];
+      if (result.closedRectify) notes.push('整改条目已转合格结案并记录复检日期');
+      if (result.relapsedRectify) notes.push('已整改条目退回「复发」');
+      if (result.createdRectify) notes.push('已自动生成整改条目');
+      if (result.affectedRoutes > 0) notes.push(`途经本点位的 ${result.affectedRoutes} 段路线通行判定已更新`);
+      message.success({
+        content: `已新增核验记录（${result.inspection.conclusion}）${notes.length ? `：${notes.join('；')}` : ''}`,
+        duration: 5,
       });
-      message.success(`已新增核验记录（${judgement.conclusion}）`);
       setForm((cur) => ({ ...cur, problem: '', date: todayStr() }));
+      setConflict(null);
     } catch (e) {
       message.error(`核验记录保存失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSaving(false);
     }
   };
+
+  const handleSaveInspection = () => void doSave(false);
+
+  /** 冲突弹窗：放弃自己这条，以对方刚录入的核验为准 */
+  const handleKeepTheirs = () => {
+    const theirs = conflict?.theirs;
+    if (!theirs) return;
+    seenLatestIdRef.current = theirs.id;
+    setConflict(null);
+    message.info(`已保留 ${theirs.date} ${theirs.inspector} 录入的核验，本条未保存`);
+  };
+
+  /** 冲突弹窗：确认自己的更新，两条核验都保留（不覆盖对方） */
+  const handleKeepBoth = () => void doSave(true);
 
   const handleCreateRectify = async () => {
     try {
@@ -422,6 +484,53 @@ export default function PointDetail() {
           />
         )}
       </Card>
+
+      <Modal
+        title="发现另一个标签页刚录入的核验"
+        open={Boolean(conflict)}
+        onCancel={() => setConflict(null)}
+        data-testid="inspection-conflict-modal"
+        footer={[
+          <Button key="cancel" onClick={() => setConflict(null)}>
+            再想想
+          </Button>,
+          <Button key="theirs" type="primary" ghost onClick={handleKeepTheirs} data-testid="conflict-keep-theirs">
+            保留对方这条
+          </Button>,
+          <Button key="both" type="primary" loading={saving} onClick={handleKeepBoth} data-testid="conflict-keep-both">
+            仍保存我的（两条都留）
+          </Button>,
+        ]}
+      >
+        {conflict ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Typography.Text>
+              你打开本页后，另一个标签页已经先录入了这条核验。请先看过对方的数据，再决定保留哪一条；
+              选择「仍保存我的」会把两条核验都留下，<strong>不会覆盖</strong>对方的记录。
+            </Typography.Text>
+            <Descriptions column={1} size="small" bordered data-testid="conflict-theirs">
+              <Descriptions.Item label="核验日期">{conflict.theirs.date}</Descriptions.Item>
+              <Descriptions.Item label="核验人">{conflict.theirs.inspector}</Descriptions.Item>
+              <Descriptions.Item label="结论">
+                <StatusBadge value={conflict.theirs.conclusion} kind="conclusion" />
+              </Descriptions.Item>
+              <Descriptions.Item label="实测">
+                坡度 {conflict.theirs.slope}% · 净宽 {conflict.theirs.clearWidth}cm · 占用
+                {conflict.theirs.occupied}
+              </Descriptions.Item>
+              <Descriptions.Item label="问题描述">
+                {conflict.theirs.problem || (
+                  <Typography.Text type="secondary">无</Typography.Text>
+                )}
+              </Descriptions.Item>
+            </Descriptions>
+            <Typography.Text type="secondary" className="gb-muted">
+              你正在录入：{form.date || todayStr()} · {judgement.conclusion}（坡度 {form.slope}% / 净宽
+              {form.clearWidth}cm）
+            </Typography.Text>
+          </Space>
+        ) : null}
+      </Modal>
     </div>
   );
 }

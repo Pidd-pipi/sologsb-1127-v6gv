@@ -1,5 +1,5 @@
 import type { Inspection, InspectionConclusion, OccupiedLevel } from '../types/inspection';
-import type { RouteSegment, RouteVerdict } from '../types/route';
+import type { RouteSegment, RouteVerdict, SegmentVerdict } from '../types/route';
 
 /** 阈值常量：依据《无障碍设计规范》常用核验口径 */
 export const SLOPE_PASS = 5; // 坡度 ≤ 5% 为合格
@@ -55,11 +55,10 @@ export function rejudge(inspection: Inspection): JudgeResult {
   });
 }
 
-/** 单段可轮椅通行判定 */
-export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount'>): {
-  passable: boolean;
-  reasons: string[];
-} {
+/** 单段物理条件判定（不含点位结论） */
+export function segmentPhysicalReasons(
+  seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount'>,
+): string[] {
   const reasons: string[] = [];
   const curb = Number(seg.curbHeight) || 0;
   const steps = Number(seg.stepCount) || 0;
@@ -67,16 +66,55 @@ export function judgeSegment(seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' 
   if (curb > CURB_FAIL) reasons.push(`路缘高差 ${curb}cm 超过 ${CURB_FAIL}cm，轮椅无法越障`);
   if (steps > 0) reasons.push(`存在 ${steps} 级台阶，需绕行或增设坡道`);
   if (obstacles > 2) reasons.push(`沿途障碍 ${obstacles} 处，通行风险偏高`);
+  return reasons;
+}
+
+/**
+ * 点位最新结论是否阻断轮椅通行：仅「合格」放行，
+ * 「不合格 / 限期整改」均视为走不通，未核验不阻断。
+ */
+export function pointWheelchairBlock(conclusion?: InspectionConclusion): string | null {
+  if (conclusion === '不合格') return '端点点位最新核验为不合格，轮椅无法通行';
+  if (conclusion === '限期整改') return '端点点位限期整改中，轮椅通行条件不达标';
+  return null;
+}
+
+export interface SegmentContext {
+  /** 点位 id → 最新核验结论 */
+  latestByPoint?: Map<string, Inspection>;
+  /** 点位 id → 点位名称，用于在卡点理由里标注位置 */
+  nameOf?: (id: string) => string;
+}
+
+/**
+ * 单段可轮椅通行判定：先看逐段物理条件（高差 / 台阶 / 障碍），
+ * 再看起终点点位的最新核验结论，任一不满足即不可通行。
+ */
+export function judgeSegment(
+  seg: Pick<RouteSegment, 'curbHeight' | 'stepCount' | 'obstacleCount' | 'fromPointId' | 'toPointId'>,
+  ctx: SegmentContext = {},
+): { passable: boolean; reasons: string[] } {
+  const reasons = segmentPhysicalReasons(seg);
+  if (ctx.latestByPoint) {
+    for (const pointId of [seg.fromPointId, seg.toPointId]) {
+      const block = pointWheelchairBlock(ctx.latestByPoint.get(pointId)?.conclusion);
+      if (block) {
+        const name = ctx.nameOf?.(pointId) ?? pointId;
+        reasons.push(`端点「${name}」：${block}`);
+      }
+    }
+  }
   return { passable: reasons.length === 0, reasons };
 }
 
-/** 全线判定：逐段判定后汇总 */
+/** 全线判定：逐段判定（物理条件 + 端点最新核验结论）后汇总 */
 export function buildVerdict(
   routeName: string,
   segments: Pick<
     RouteSegment,
     'curbHeight' | 'stepCount' | 'obstacleCount' | 'length' | 'order' | 'fromPointId' | 'toPointId'
   >[],
+  ctx: SegmentContext = {},
 ): RouteVerdict {
   const ordered = [...segments].sort((a, b) => a.order - b.order);
   const totalLength = Math.round(ordered.reduce((n, s) => n + (Number(s.length) || 0), 0) * 10) / 10;
@@ -84,11 +122,18 @@ export function buildVerdict(
   const totalSteps = ordered.reduce((n, s) => n + (Number(s.stepCount) || 0), 0);
   const maxCurbHeight = ordered.reduce((n, s) => Math.max(n, Number(s.curbHeight) || 0), 0);
   const reasons: string[] = [];
-  ordered.forEach((s) => {
-    const r = judgeSegment(s);
+  const segVerdicts: SegmentVerdict[] = ordered.map((s) => {
+    const r = judgeSegment(s, ctx);
     if (!r.passable) {
       reasons.push(`第 ${s.order} 段：${r.reasons.join('；')}`);
     }
+    return {
+      order: s.order,
+      fromPointId: s.fromPointId,
+      toPointId: s.toPointId,
+      passable: r.passable,
+      reasons: r.reasons,
+    };
   });
   return {
     routeName,
@@ -98,5 +143,6 @@ export function buildVerdict(
     totalSteps,
     maxCurbHeight,
     reasons: ordered.length === 0 ? ['尚未串联路段'] : reasons,
+    segments: segVerdicts,
   };
 }

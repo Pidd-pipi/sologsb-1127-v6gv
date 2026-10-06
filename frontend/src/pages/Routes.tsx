@@ -14,6 +14,7 @@ import {
   Statistic,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -24,6 +25,7 @@ import { usePointStore } from '../stores/pointStore';
 import { useRouteStore, type DraftSegment } from '../stores/routeStore';
 import type { RouteSegment, RouteVerdict } from '../types/route';
 import { buildVerdict, judgeSegment, CURB_FAIL, CURB_PASS } from '../utils/routeCheck';
+import { latestByPoint as buildLatestMap } from '../utils/reconcile';
 
 export default function Routes() {
   const { message } = App.useApp();
@@ -50,6 +52,16 @@ export default function Routes() {
     [points],
   );
   const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
+  /** 点位 id → 最新核验结论（路线判定随最新核验联动重算） */
+  const inspections = usePointStore((s) => s.inspections);
+  const latestByPoint = useMemo(() => buildLatestMap(inspections), [inspections]);
+  const verdictCtx = useMemo(
+    () => ({
+      latestByPoint,
+      nameOf: (pid: string) => points.find((p) => p.id === pid)?.name ?? pid,
+    }),
+    [latestByPoint, points],
+  );
 
   const draftVerdict = verdict ?? null;
 
@@ -147,9 +159,17 @@ export default function Routes() {
     {
       title: '段判定',
       width: 110,
-      render: (_, row) => (
-        <StatusBadge value={judgeSegment(row).passable ? '可通行' : '不可通行'} kind="route" />
-      ),
+      render: (_, row) => {
+        const r = judgeSegment(row, verdictCtx);
+        const badge = <StatusBadge value={r.passable ? '可通行' : '不可通行'} kind="route" />;
+        return r.passable ? (
+          badge
+        ) : (
+          <Tooltip title={r.reasons.join('；')}>
+            <span>{badge}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '操作',
@@ -178,8 +198,20 @@ export default function Routes() {
     {
       title: '可轮椅通行',
       dataIndex: 'wheelchairPassable',
-      width: 120,
-      render: (v: boolean) => <StatusBadge value={v ? '可通行' : '不可通行'} kind="route" />,
+      width: 130,
+      render: (_: boolean, row) => {
+        // 通行判定随端点最新核验结论联动，落库字段仅作基线，展示以实时重算为准
+        const r = judgeSegment(row, verdictCtx);
+        const badge = <StatusBadge value={r.passable ? '可通行' : '不可通行'} kind="route" />;
+        if (r.passable) return badge;
+        return (
+          <Tooltip title={`卡点：${r.reasons.join('；')}`}>
+            <Tag color="error" style={{ marginInlineEnd: 0, cursor: 'help' }} data-testid={`blocked-seg-${row.order}`}>
+              卡在第 {row.order} 段
+            </Tag>
+          </Tooltip>
+        );
+      },
     },
   ];
 
@@ -191,9 +223,20 @@ export default function Routes() {
       byName.set(s.routeName, list);
     }
     const rows: RouteVerdict[] = [];
-    byName.forEach((list, name) => rows.push(buildVerdict(name, list)));
+    byName.forEach((list, name) => rows.push(buildVerdict(name, list, verdictCtx)));
     return rows;
-  }, [segments]);
+  }, [segments, verdictCtx]);
+
+  /** 路线名 → 卡住的段序及原因，用于明细表行高亮与说明 */
+  const blockedSegmentMap = useMemo(() => {
+    const map = new Map<string, Map<number, string[]>>();
+    savedVerdicts.forEach((v) => {
+      const segMap = new Map<number, string[]>();
+      v.segments.filter((s) => !s.passable).forEach((s) => segMap.set(s.order, s.reasons));
+      if (segMap.size) map.set(v.routeName, segMap);
+    });
+    return map;
+  }, [savedVerdicts]);
 
   return (
     <div>
@@ -350,17 +393,34 @@ export default function Routes() {
             )}
           </Card>
 
-          <Card title="已编制路线判定" size="small" style={{ marginTop: 16 }}>
+          <Card title="已编制路线判定" size="small" style={{ marginTop: 16 }} data-testid="saved-verdicts">
             {savedVerdicts.length ? (
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Space direction="vertical" size={10} style={{ width: '100%' }}>
                 {savedVerdicts.map((v) => (
-                  <Space key={v.routeName} size={8} wrap>
-                    <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
-                    <Typography.Text>{v.routeName}</Typography.Text>
-                    <Tag>{v.totalLength} m</Tag>
-                    <Tag>台阶 {v.totalSteps}</Tag>
-                    <Tag>障碍 {v.totalObstacles}</Tag>
-                  </Space>
+                  <div key={v.routeName}>
+                    <Space size={8} wrap>
+                      <StatusBadge value={v.passable ? '可通行' : '不可通行'} kind="route" />
+                      <Typography.Text>{v.routeName}</Typography.Text>
+                      <Tag>{v.totalLength} m</Tag>
+                      <Tag>台阶 {v.totalSteps}</Tag>
+                      <Tag>障碍 {v.totalObstacles}</Tag>
+                    </Space>
+                    {!v.passable ? (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        style={{ marginTop: 6 }}
+                        message="路线当前走不通"
+                        description={
+                          <ul style={{ margin: 0, paddingInlineStart: 18 }} data-testid={`blocked-reasons-${v.routeName}`}>
+                            {v.reasons.map((r) => (
+                              <li key={r}>{r}</li>
+                            ))}
+                          </ul>
+                        }
+                      />
+                    ) : null}
+                  </div>
                 ))}
               </Space>
             ) : (
@@ -378,6 +438,9 @@ export default function Routes() {
             pagination={{ pageSize: 8, hideOnSinglePage: true }}
             dataSource={segments}
             columns={savedColumns}
+            rowClassName={(row) =>
+              blockedSegmentMap.get(row.routeName)?.has(row.order) ? 'gb-overdue-row' : ''
+            }
           />
         ) : (
           <EmptyState title="暂无路段记录" description="编制并保存后在此查看" compact />

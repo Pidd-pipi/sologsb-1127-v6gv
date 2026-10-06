@@ -4,7 +4,8 @@ import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
 import type { RectifyPlan } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
-import { judgeInspection } from '../utils/routeCheck';
+import { judgeInspection, judgeSegment } from '../utils/routeCheck';
+import { latestByPoint } from '../utils/reconcile';
 
 export const DB_NAME = 'gbaccessmap-db';
 
@@ -327,18 +328,25 @@ function buildSeed() {
     };
   });
   const routes: RouteSegment[] = [];
+  const latestMap = latestByPoint(inspections);
   SEED_ROUTES.forEach((r, ri) => {
     for (let i = 1; i < r.pointIds.length; i += 1) {
+      const fromPointId = r.pointIds[i - 1];
+      const toPointId = r.pointIds[i];
       routes.push({
         id: `rts-seed-${ri + 1}-${i}`,
         routeName: r.routeName,
-        fromPointId: r.pointIds[i - 1],
-        toPointId: r.pointIds[i],
+        fromPointId,
+        toPointId,
         length: Math.round((r.length / (r.pointIds.length - 1)) * 10) / 10,
         obstacleCount: r.obstacleCount,
         stepCount: r.stepCount,
         curbHeight: r.curbHeight,
-        wheelchairPassable: r.stepCount === 0 && r.curbHeight <= 3 && r.obstacleCount <= 2,
+        // 通行标记 = 逐段物理条件 + 两端点位最新核验结论
+        wheelchairPassable: judgeSegment(
+          { fromPointId, toPointId, curbHeight: r.curbHeight, stepCount: r.stepCount, obstacleCount: r.obstacleCount },
+          { latestByPoint: latestMap },
+        ).passable,
         order: i,
         createdAt: now,
       });

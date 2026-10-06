@@ -6,6 +6,8 @@ import { makeId, toPlain } from '../utils/format';
 import { judgeSegment, buildVerdict } from '../utils/routeCheck';
 import { segmentLength } from '../utils/geo';
 import type { RouteVerdict } from '../types/route';
+import { usePointStore } from './pointStore';
+import { subscribeDbChanges, notifyDbChanged } from '../utils/dbEvents';
 
 /** 编辑中的路段（尚未落库） */
 export interface DraftSegment {
@@ -28,7 +30,7 @@ interface RouteState {
   chain: string[];
   draftSegments: DraftSegment[];
   verdict: RouteVerdict | null;
-  load: () => Promise<void>;
+  load: (silent?: boolean) => Promise<void>;
   setDraftName: (name: string) => void;
   setChain: (ids: string[]) => void;
   toggleChainPoint: (id: string) => void;
@@ -54,8 +56,8 @@ export const useRouteStore = create<RouteState>((set, get) => ({
   draftSegments: [],
   verdict: null,
 
-  load: async () => {
-    set({ loading: true, error: '' });
+  load: async (silent = false) => {
+    if (!silent) set({ loading: true, error: '' });
     try {
       const rows = await db.routes.toArray();
       set({
@@ -66,7 +68,11 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         loaded: true,
       });
     } catch (e) {
-      set({ loading: false, loaded: true, error: e instanceof Error ? e.message : String(e) });
+      set({
+        loading: false,
+        loaded: true,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   },
 
@@ -121,13 +127,19 @@ export const useRouteStore = create<RouteState>((set, get) => ({
 
   computeVerdict: () => {
     const { draftSegments, draftName } = get();
-    const verdict = buildVerdict(draftName, draftSegments);
+    const points = usePointStore.getState().points;
+    const latestByPoint = usePointStore.getState().latestInspectionMap();
+    const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
+    const verdict = buildVerdict(draftName, draftSegments, { latestByPoint, nameOf });
     set({ verdict });
     return verdict;
   },
 
   saveRoute: async () => {
     const { draftSegments, draftName } = get();
+    const points = usePointStore.getState().points;
+    const latestByPoint = usePointStore.getState().latestInspectionMap();
+    const nameOf = (id: string) => points.find((p) => p.id === id)?.name ?? id;
     const rows: RouteSegment[] = draftSegments.map((seg) =>
       toPlain({
         id: makeId('rts'),
@@ -138,7 +150,8 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         obstacleCount: seg.obstacleCount,
         stepCount: seg.stepCount,
         curbHeight: seg.curbHeight,
-        wheelchairPassable: judgeSegment(seg).passable,
+        // 保存时即按「物理条件 + 端点最新核验结论」联合判定
+        wheelchairPassable: judgeSegment(seg, { latestByPoint, nameOf }).passable,
         order: seg.order,
         createdAt: new Date().toISOString(),
       }),
@@ -151,8 +164,17 @@ export const useRouteStore = create<RouteState>((set, get) => ({
         a.routeName === b.routeName ? a.order - b.order : a.routeName.localeCompare(b.routeName),
       ),
     });
+    notifyDbChanged(['routes']);
     return rows.length;
   },
 
   resetDraft: () => set({ draftSegments: [], verdict: null, chain: [] }),
 }));
+
+// 核验 / 整改 / 点位在其他标签页变化后，路线通行标记可能已被联动重算，静默刷新明细
+subscribeDbChanges((tables) => {
+  if (!useRouteStore.getState().loaded) return;
+  if (tables.some((t) => ['routes', 'inspections', 'points', 'rectifies'].includes(t))) {
+    void useRouteStore.getState().load(true);
+  }
+});

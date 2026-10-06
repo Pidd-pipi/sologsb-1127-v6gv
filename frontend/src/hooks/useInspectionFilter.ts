@@ -5,6 +5,7 @@ import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
 import type { RectifyPlan } from '../types/rectify';
 import { isOverdue } from '../utils/format';
+import { compareInspections } from '../utils/reconcile';
 
 export interface InspectionFilterResult {
   filter: InspectionFilter;
@@ -62,7 +63,7 @@ export function useInspectionFilter(): InspectionFilterResult {
     const map = new Map<string, Inspection>();
     for (const i of inspections) {
       const cur = map.get(i.pointId);
-      if (!cur || cur.date < i.date) map.set(i.pointId, i);
+      if (!cur || compareInspections(i, cur) > 0) map.set(i.pointId, i);
     }
     return map;
   }, [inspections]);

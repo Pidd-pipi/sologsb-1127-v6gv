@@ -88,7 +88,7 @@ sologsb-1127/
         ├── pages/{Overview,PointNew,PointDetail,Routes,MapView,Rectify}.tsx
         ├── layouts/AppLayout.tsx
         ├── router/index.tsx
-        └── utils/{routeCheck,geo,format}.ts
+        └── utils/{routeCheck,reconcile,recalibrate,dbEvents,geo,format}.ts
 ```
 
 ## 判定阈值（`src/utils/routeCheck.ts`）
@@ -96,3 +96,13 @@ sologsb-1127/
 - 坡度：≤ 5% 合格，> 5% 限期整改，> 8% 不合格；
 - 净宽：≥ 120cm 合格，< 120cm 限期整改，< 90cm 不合格；
 - 路缘高差：≤ 3cm 可轮椅通行，> 6cm 判定不可通行；存在台阶需绕行或增设坡道。
+
+## 数据联动规则（补录核验后自动重算）
+
+所有派生状态一律以**每个点位最新一次核验**（同日按录入时间 `createdAt` 决胜）为准，在同一 Dexie 事务内完成：
+
+- **整改条目**（`src/utils/reconcile.ts`）：最新结论转「合格」时，未结案条目转「已整改」结案并写入复检日期（取核验日期）；已结案点位再次「不合格」时退回「复发」；「限期整改」保持跟踪不变；不合格且无在办条目时自动补建待整改条目。
+- **通行路线**：`wheelchairPassable` 不再保存即冻结，而是按「路段物理条件 + 起终点点位最新结论」联合重算——仅端点「合格」放行，「不合格 / 限期整改」均走不通，未核验不阻断。全线判定逐段返回卡点理由（卡在第几段、卡在物理障碍还是端点结论）。
+- **总览合格率 / 待整改数**：`useInspectionFilter` 直接从最新核验映射与整改状态派生，数据变更即刷新。
+- **历史数据**：首次加载时 `recalibrateDerivedData()` 幂等校准一次旧整改条目与旧路线标记。
+- **多标签页**：写库后经 `BroadcastChannel`（`src/utils/dbEvents.ts`，降级 storage 事件）广播变更表，其他标签页静默重载。点位详情保存核验前先读库比对：若对方标签页已录入更新的核验，弹出冲突确认，可「保留对方这条」或「仍保存我的（两条都留）」，不会覆盖对方数据。

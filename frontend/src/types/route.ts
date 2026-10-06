@@ -22,6 +22,15 @@ export interface RouteSegment {
 
 export type RouteSegmentDraft = Omit<RouteSegment, 'id' | 'createdAt' | 'wheelchairPassable'>;
 
+/** 单段判定明细（供路线列表标出卡在哪一段） */
+export interface SegmentVerdict {
+  order: number;
+  fromPointId: string;
+  toPointId: string;
+  passable: boolean;
+  reasons: string[];
+}
+
 /** 全线判定结果 */
 export interface RouteVerdict {
   routeName: string;
@@ -31,4 +40,6 @@ export interface RouteVerdict {
   totalSteps: number;
   maxCurbHeight: number;
   reasons: string[];
+  /** 逐段判定，顺序与路段 order 一致 */
+  segments: SegmentVerdict[];
 }
